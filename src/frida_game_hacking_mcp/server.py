@@ -178,19 +178,29 @@ def _unpack_value(data: bytes, value_type: str) -> Any:
     return struct.unpack("<i", data)[0]
 
 
-def _run_once(script_code: str) -> list:
+def _run_once(script_code: str,
+              errors_out: Optional[List[Dict[str, Any]]] = None) -> list:
     """Run a one-shot Frida script synchronously; return list of send() payloads.
-    
+
     Scripts that call send() synchronously complete before load() returns,
     so payloads are collected immediately. Scripts with asynchronous send()
     calls (timers, callbacks) will get an empty list — those tools should
     use load_script() + get_script_output() instead.
+
+    If *errors_out* is provided (a list), error messages are appended there
+    instead of being silently swallowed.  Each entry is a dict with at least
+    ``description`` and ``stack`` keys.
     """
     result_data: List[str] = []
 
     def on_message(message, data):
         if message["type"] == "send":
             result_data.append(message["payload"])
+        elif message["type"] == "error" and errors_out is not None:
+            errors_out.append({
+                "description": message.get("description"),
+                "stack": message.get("stack"),
+            })
 
     script = _session.session.create_script(script_code)
     script.on("message", on_message)
@@ -319,8 +329,9 @@ CHEAT ENGINE-STYLE WORKFLOW:
 1. Find your target process:
    list_processes("game")
 
-2. Attach to the process:
+2. Attach to the process (works by name or PID):
    attach("game.exe")
+   attach("15400")          # numeric strings are auto-coerced to int
 
 3. Scan for a known value (e.g., health = 100):
    scan_value(100, "int32")
@@ -515,7 +526,13 @@ def attach(target: Union[str, int]) -> Dict[str, Any]:
     
     try:
         device = get_device()
-        
+
+        # MCP clients often send the PID as a JSON string; Frida interprets
+        # strings as process names, which raises ProcessNotFoundError for a
+        # numeric value.  Coerce obvious numeric PIDs to int first.
+        if isinstance(target, str) and target.strip().lstrip("-").isdigit():
+            target = int(target.strip())
+
         if isinstance(target, str):
             _session.session = device.attach(target)
             _session.process_name = target
@@ -537,7 +554,12 @@ def attach(target: Union[str, int]) -> Dict[str, Any]:
         }
     
     except frida.ProcessNotFoundError:
-        return {"error": f"Process not found: {target}"}
+        kind = "PID" if isinstance(target, int) else "name"
+        return {
+            "error": f"Process not found as {kind}: {target}",
+            "hint": "Verify the process is running with list_processes(), "
+                    "then attach by its exact name or PID."
+        }
     except frida.PermissionDeniedError:
         return {"error": "Permission denied. Try running as administrator."}
     except Exception as e:
@@ -1955,7 +1977,9 @@ def _build_probe_js(extra_names: List[str]) -> str:
         if clean in _EXTRAS_WHITELIST and clean not in {p[0] for p in ns_list}:
             ns_list.append((clean, clean))
     pairs_js = ",".join(f'["{k}","{v}"]' for k, v in ns_list)
-    return _JS_PROBE.replace("G_NAME_LIST", pairs_js)
+    # Wrap in ONE outer array: without it the comma operator collapses the
+    # list to only the last pair, so .forEach never sees the rest.
+    return _JS_PROBE.replace("G_NAME_LIST", f"[{pairs_js}]")
 
 
 @mcp.tool()
@@ -1992,9 +2016,13 @@ def get_js_api_surface(filter: str = "", extra: str = "",
     else:
         extra_names = [x.strip() for x in extra.split(",") if x.strip()]
         probe_js = _build_probe_js(extra_names)
-        results = _run_once(probe_js)
+        errors: List[Dict[str, Any]] = []
+        results = _run_once(probe_js, errors_out=errors)
         if not results:
-            return {"error": "API probe returned no data. Try force_refresh=True."}
+            out = {"error": "API probe returned no data. Try force_refresh=True."}
+            if errors:
+                out["js_error"] = errors[0]
+            return out
         surface = results[0]  # first send() payload
         if not isinstance(surface, dict) or "groups" not in surface:
             return {"error": "Malformed probe result.", "raw": results}
@@ -2013,7 +2041,7 @@ def get_js_api_surface(filter: str = "", extra: str = "",
         out["matches"] = [
             f"{ns}.{m}" for ns, members in (surface.get("groups") or {}).items()
             if isinstance(members, list)
-            for m in members if flt in m.lower()
+            for m in members if flt in f"{ns}.{m}".lower()
         ]
 
     return out
