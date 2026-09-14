@@ -125,6 +125,40 @@ For scripts that keep running (timers, hooks), poll repeatedly:
 {"success": true}
 ```
 
+## Self-Fixing Removed APIs
+
+Frida 17.x removed several static APIs (`Module.findBaseAddress`,
+`Module.findExportByName`, `Memory.readByteArray`, ...). When a loaded
+script calls one, the buffered error is enriched with the failing source
+line and — once the API surface is cached — the live member list:
+
+```
+> load_script('var b = Module.findBaseAddress("GameAssembly.dll");', "probe")
+{
+  "error": "Failed to load script: ...",
+  "messages": [
+    {"type": "error",
+     "description": "TypeError: not a function",
+     "source_line_no": 1,
+     "source_line": "var b = Module.findBaseAddress(\"GameAssembly.dll\");",
+     "missing_member": "Module.findBaseAddress",
+     "available_members": ["getBaseAddress", "getExportByName", ...]}
+  ]
+}
+```
+
+If `available_members` is absent, the surface was not cached yet — call
+`get_js_api_surface()` once, then re-read the error:
+
+```
+> get_js_api_surface(filter="getExport")
+{"matches": ["Module.getExportByName", "Module.prototype.getExportByName", ...]}
+
+> load_script('var b = Process.findModuleByName("GameAssembly.dll").getExportByName("...");', "probe")
+```
+
+Rule: introspect the live surface, never guess API names.
+
 ## Benefits of send() + get_script_output()
 
 1. **No RPC method guessing** — the agent reads whatever the script sends

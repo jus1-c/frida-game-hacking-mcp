@@ -29,6 +29,7 @@ import logging
 import base64
 import io
 import os
+import re
 from typing import Optional, Dict, List, Any, Union
 from dataclasses import dataclass, field
 
@@ -95,6 +96,8 @@ class FridaSession:
         self.breakpoints: Dict[str, Any] = {}
         self.custom_scripts: Dict[str, Any] = {}
         self.script_messages: Dict[str, List[Dict[str, Any]]] = {}
+        self.script_sources: Dict[str, str] = {}
+        self.js_surface: Optional[Dict[str, Any]] = None
     
     def is_attached(self) -> bool:
         return self.session is not None and not self.session.is_detached
@@ -109,6 +112,8 @@ class FridaSession:
         self.breakpoints.clear()
         self.custom_scripts.clear()
         self.script_messages.clear()
+        self.script_sources.clear()
+        self.js_surface = None
 
 
 # Global session instance
@@ -194,6 +199,45 @@ def _run_once(script_code: str) -> list:
     return result_data
 
 
+def _error_source_line_no(stack: Optional[str]) -> Optional[int]:
+    """Extract the script line number from a Frida JS error stack.
+
+    Frida stack frames look like:  at <eval> (script.js:3:15)
+    Returns the first frame's line number, or None if unparseable.
+    """
+    if not stack:
+        return None
+    for line in stack.splitlines():
+        m = re.search(r':(\d+)(?::\d+)?\s*\)?\s*$', line.strip())
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _enrich_error_message(msg: Dict[str, Any], name: str) -> None:
+    """Attach source line + live-API hints to a buffered error message."""
+    source = _session.script_sources.get(name)
+    if not source:
+        return
+    lines = source.splitlines()
+    line_no = _error_source_line_no(msg.get("stack"))
+    if line_no and 0 < line_no <= len(lines):
+        msg["source_line_no"] = line_no
+        msg["source_line"] = lines[line_no - 1].strip()
+        surface = _session.js_surface
+        if surface:
+            groups = surface.get("groups") or {}
+            for ns, member in re.findall(r'\b([A-Z]\w*)\.(\w+)', msg["source_line"]):
+                avail = groups.get(ns)
+                if isinstance(avail, list) and member not in avail:
+                    msg["missing_member"] = f"{ns}.{member}"
+                    msg["available_members"] = avail
+                    break
+        else:
+            msg["hint"] = ("Call get_js_api_surface() to list the live Frida JS "
+                           "API, then rewrite the script.")
+
+
 # =============================================================================
 # STANDARD MCP TOOLS
 # =============================================================================
@@ -242,9 +286,12 @@ def list_capabilities() -> Dict[str, Any]:
             ],
             "standard": [
                 "list_capabilities", "get_documentation", "check_installation"
+            ],
+            "diagnostics": [
+                "get_js_api_surface"
             ]
         },
-        "total_tools": 42
+        "total_tools": 43
     }
 
 
@@ -314,6 +361,27 @@ Scripts communicate by calling send(). Read output with get_script_output().
 4. Pass new input: unload + load a new script with updated values.
 
 No RPC method guessing needed — read whatever the script sends.
+
+SELF-FIXING REMOVED APIS:
+   If a script fails with "not a function" (e.g. Module.findBaseAddress
+   was removed in Frida 17.x), the error message is enriched with:
+     - source_line_no / source_line  (the failing line)
+     - missing_member / available_members  (live API truth, if surface cached)
+     - hint: call get_js_api_surface()  (when surface not yet cached)
+   Workflow: read the enriched error -> get_js_api_surface() -> rewrite.
+"""
+        docs["api_surface"] = """
+API SURFACE INTROSPECTION:
+
+   get_js_api_surface() lists the LIVE Frida JS API in the target process.
+   Never hardcode API lists — introspect instead.
+
+   get_js_api_surface()                      # full grouped surface
+   get_js_api_surface(filter="getExport")    # matching "Namespace.member" paths
+   get_js_api_surface(extra="Stalker,Socket")# add whitelisted namespaces
+   get_js_api_surface(force_refresh=True)    # rebuild cache
+
+   Requires attach(). Cached per session; cleared on detach.
 """
     
     elif topic == "scanning":
@@ -1733,6 +1801,7 @@ def load_script(script_code: str, name: str = "custom") -> Dict[str, Any]:
     try:
         script = _session.session.create_script(script_code)
         _session.script_messages[name] = []
+        _session.script_sources[name] = script_code
         
         def _buffer_message(message, data):
             import time as _time
@@ -1741,6 +1810,8 @@ def load_script(script_code: str, name: str = "custom") -> Dict[str, Any]:
                    "description": message.get("description", None),
                    "stack": message.get("stack", None),
                    "time": _time.time()}
+            if message.get("type") == "error":
+                _enrich_error_message(msg, name)
             _session.script_messages[name].append(msg)
             if len(_session.script_messages[name]) > 200:
                 _session.script_messages[name] = _session.script_messages[name][-200:]
@@ -1757,7 +1828,14 @@ def load_script(script_code: str, name: str = "custom") -> Dict[str, Any]:
         }
     
     except Exception as e:
-        return {"error": f"Failed to load script: {str(e)}"}
+        # Load failed: surface any buffered (enriched) error messages, then
+        # clean up partial state so the name can be reused.
+        msgs = _session.script_messages.pop(name, [])
+        _session.script_sources.pop(name, None)
+        out = {"error": f"Failed to load script: {str(e)}"}
+        if msgs:
+            out["messages"] = msgs
+        return out
 
 
 @mcp.tool()
@@ -1780,6 +1858,7 @@ def unload_script(name: str) -> Dict[str, Any]:
         _session.custom_scripts[name].unload()
         del _session.custom_scripts[name]
         _session.script_messages.pop(name, None)
+        _session.script_sources.pop(name, None)
         return {"success": True, "name": name}
     
     except Exception as e:
@@ -1832,6 +1911,112 @@ def list_custom_scripts() -> Dict[str, Any]:
         count = len(_session.script_messages.get(name, []))
         result.append({"name": name, "pending_messages": count})
     return {"count": len(result), "scripts": result}
+
+
+# ---------- API surface introspection ----------
+
+_EXTRAS_WHITELIST = frozenset({
+    "Stalker", "Socket", "File", "Thread", "DebugSymbol",
+    "ObjC", "Java", "Kernel", "System", "CModule",
+    "NativeFunction", "NativeCallback", "Ptr", "Int64", "UInt64",
+    "NativeResource", "ModuleMap", "MemoryScan",
+})
+
+_CORE_NAMESPACES = [
+    ("Frida",            "Frida"),
+    ("Process",          "Process"),
+    ("Module",           "Module"),
+    ("Module_instance",  "Module.prototype"),
+    ("Memory",           "Memory"),
+    ("NativePointer_instance", "NativePointer.prototype"),
+    ("Interceptor",      "Interceptor"),
+    ("ApiResolver",      "ApiResolver"),
+    ("Console",          "Console"),
+]
+
+_JS_PROBE = r"""
+function _mp(o){ try { return Object.getOwnPropertyNames(o); } catch(e){ return null; } }
+function _ev(n){ try { return eval(n); } catch(e){ return null; } }
+var _g = {};
+G_NAME_LIST.forEach(function(pair){
+    var key = pair[0], path = pair[1];
+    var obj = _ev(path);
+    if(obj !== null) _g[key] = _mp(obj);
+});
+send({ frida_version: (typeof Frida !== "undefined" && Frida.version) || null, groups: _g });
+"""
+
+
+def _build_probe_js(extra_names: List[str]) -> str:
+    """Build the JS probe script with core + extra namespaces."""
+    ns_list = list(_CORE_NAMESPACES)
+    for name in extra_names:
+        clean = name.strip()
+        if clean in _EXTRAS_WHITELIST and clean not in {p[0] for p in ns_list}:
+            ns_list.append((clean, clean))
+    pairs_js = ",".join(f'["{k}","{v}"]' for k, v in ns_list)
+    return _JS_PROBE.replace("G_NAME_LIST", pairs_js)
+
+
+@mcp.tool()
+def get_js_api_surface(filter: str = "", extra: str = "",
+                       force_refresh: bool = False) -> Dict[str, Any]:
+    """
+    Introspect the live Frida JS runtime API in the target process.
+
+    Returns grouped API members (e.g. Module: [getExportByName, ...]) and
+    the Frida version string. This is the *truth* — never hardcode API lists.
+
+    Requires: attach() first.
+
+    Args:
+        filter:  Optional substring to match member paths (case-insensitive).
+                 When set, returns only matching "Namespace.member" paths in
+                 the "matches" field.
+        extra:   Comma-separated additional namespace names to probe beyond the
+                 core set (e.g. "Stalker,Socket"). Whitelisted names only;
+                 unknown names are silently ignored.
+        force_refresh: If True, rebuild the cache instead of returning it.
+
+    Returns:
+        Surface dict, and optionally a filtered "matches" list.
+    """
+    global _session
+
+    if not _session.is_attached():
+        return {"error": "Not attached. Use attach() first."}
+
+    if _session.js_surface and not force_refresh:
+        surface = _session.js_surface
+        cached = True
+    else:
+        extra_names = [x.strip() for x in extra.split(",") if x.strip()]
+        probe_js = _build_probe_js(extra_names)
+        results = _run_once(probe_js)
+        if not results:
+            return {"error": "API probe returned no data. Try force_refresh=True."}
+        surface = results[0]  # first send() payload
+        if not isinstance(surface, dict) or "groups" not in surface:
+            return {"error": "Malformed probe result.", "raw": results}
+        _session.js_surface = surface
+        cached = False
+
+    out: Dict[str, Any] = {
+        "success": True,
+        "frida_version": surface.get("frida_version"),
+        "surface": surface.get("groups", {}),
+        "cached": cached,
+    }
+
+    if filter:
+        flt = filter.lower()
+        out["matches"] = [
+            f"{ns}.{m}" for ns, members in (surface.get("groups") or {}).items()
+            if isinstance(members, list)
+            for m in members if flt in m.lower()
+        ]
+
+    return out
 
 
 # =============================================================================
