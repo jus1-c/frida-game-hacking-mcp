@@ -24,6 +24,7 @@ Usage:
 """
 
 import struct
+import json
 import logging
 import base64
 import io
@@ -93,6 +94,7 @@ class FridaSession:
         self.hooks: Dict[str, HookInfo] = {}
         self.breakpoints: Dict[str, Any] = {}
         self.custom_scripts: Dict[str, Any] = {}
+        self.script_messages: Dict[str, List[Dict[str, Any]]] = {}
     
     def is_attached(self) -> bool:
         return self.session is not None and not self.session.is_detached
@@ -106,6 +108,7 @@ class FridaSession:
         self.hooks.clear()
         self.breakpoints.clear()
         self.custom_scripts.clear()
+        self.script_messages.clear()
 
 
 # Global session instance
@@ -170,6 +173,27 @@ def _unpack_value(data: bytes, value_type: str) -> Any:
     return struct.unpack("<i", data)[0]
 
 
+def _run_once(script_code: str) -> list:
+    """Run a one-shot Frida script synchronously; return list of send() payloads.
+    
+    Scripts that call send() synchronously complete before load() returns,
+    so payloads are collected immediately. Scripts with asynchronous send()
+    calls (timers, callbacks) will get an empty list — those tools should
+    use load_script() + get_script_output() instead.
+    """
+    result_data: List[str] = []
+
+    def on_message(message, data):
+        if message["type"] == "send":
+            result_data.append(message["payload"])
+
+    script = _session.session.create_script(script_code)
+    script.on("message", on_message)
+    script.load()
+    script.unload()
+    return result_data
+
+
 # =============================================================================
 # STANDARD MCP TOOLS
 # =============================================================================
@@ -203,13 +227,14 @@ def list_capabilities() -> Dict[str, Any]:
             ],
             "function_hooking": [
                 "hook_function", "unhook_function", "replace_function",
-                "hook_native_function", "list_hooks", "intercept_module_function"
+                "list_hooks", "intercept_module_function"
             ],
             "debugging": [
                 "set_breakpoint", "remove_breakpoint", "list_breakpoints", "read_registers"
             ],
             "script_management": [
-                "load_script", "unload_script", "call_rpc"
+                "load_script", "unload_script", "get_script_output",
+                "list_custom_scripts"
             ],
             "window_interaction": [
                 "list_windows", "screenshot_window", "screenshot_screen",
@@ -272,6 +297,24 @@ FUNCTION HOOKING:
             "int32/uint32 (4 bytes)", "int64/uint64 (8 bytes)",
             "float (4 bytes)", "double (8 bytes)", "string"
         ]
+        docs["custom_scripts"] = """
+CUSTOM SCRIPTS (send + poll):
+
+Scripts communicate by calling send(). Read output with get_script_output().
+
+1. Load a script:
+   load_script('send({type: "health", value: ptr("0x12345678").readU32()});', "read_hp")
+
+2. Read output:
+   get_script_output("read_hp")
+
+3. For long-running scripts, poll repeatedly:
+   get_script_output("read_hp", limit=10, clear=true)
+
+4. Pass new input: unload + load a new script with updated values.
+
+No RPC method guessing needed — read whatever the script sends.
+"""
     
     elif topic == "scanning":
         docs["workflow"] = """
@@ -330,6 +373,10 @@ def check_installation() -> Dict[str, Any]:
     
     if FRIDA_AVAILABLE:
         result["frida_version"] = frida.__version__
+        major, minor = (int(x) for x in frida.__version__.split(".")[:2])
+        result["compatible"] = (major, minor) >= (17, 17)
+        if not result["compatible"]:
+            result["warning"] = f"Detected Frida {frida.__version__}; API requires >= 17.17.0."
         result["working"] = True
         try:
             device = get_device()
@@ -550,7 +597,8 @@ def get_session_info() -> Dict[str, Any]:
         "scan_value_type": _session.scan_state.value_type,
         "active_hooks": len(_session.hooks),
         "active_breakpoints": len(_session.breakpoints),
-        "custom_scripts": len(_session.custom_scripts)
+        "custom_scripts": len(_session.custom_scripts),
+        "pending_messages": sum(len(m) for m in _session.script_messages.values())
     }
 
 
@@ -582,7 +630,7 @@ def read_memory(address: str, size: int = 16, format: str = "hex") -> Dict[str, 
         script_code = f"""
         var addr = ptr("{hex(addr)}");
         try {{
-            var data = Memory.readByteArray(addr, {size});
+            var data = addr.readByteArray({size});
             var hex = '';
             var bytes = new Uint8Array(data);
             for (var i = 0; i < bytes.length; i++) {{
@@ -594,15 +642,7 @@ def read_memory(address: str, size: int = 16, format: str = "hex") -> Dict[str, 
         }}
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
+        result_data = _run_once(script_code)
         
         if not result_data:
             return {"error": "No response from Frida"}
@@ -670,7 +710,7 @@ def write_memory(address: str, data: str, value_type: str = "bytes") -> Dict[str
         byte_array = ", ".join(f"0x{b:02x}" for b in write_bytes)
         script_code = f"""
         var addr = ptr("{hex(addr)}");
-        Memory.writeByteArray(addr, [{byte_array}]);
+        addr.writeByteArray([{byte_array}]);
         send("done");
         """
         
@@ -707,37 +747,27 @@ def list_memory_regions(protection: str = "") -> Dict[str, Any]:
         return {"error": "Not attached. Use attach() first."}
     
     try:
-        script_code = """
-        var ranges = Process.enumerateRanges('r--');
-        var result = ranges.map(function(r) {
-            return {
+        # "---" means all protections; otherwise pass the filter to Frida
+        js_protection = json.dumps(protection if protection else "---")
+        script_code = f"""
+        var ranges = Process.enumerateRanges({js_protection});
+        var result = ranges.map(function(r) {{
+            return {{
                 base: r.base.toString(),
                 size: r.size,
                 protection: r.protection,
                 file: r.file ? r.file.path : null
-            };
-        });
+            }};
+        }});
         send(JSON.stringify(result));
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
+        result_data = _run_once(script_code)
         
         if not result_data:
             return {"error": "Failed to enumerate regions"}
         
-        import json
         regions = json.loads(result_data[0])
-        
-        if protection:
-            regions = [r for r in regions if protection in r['protection']]
         
         return {"count": len(regions), "regions": regions[:100]}
     
@@ -774,10 +804,12 @@ def scan_value(value: Union[int, float, str], value_type: str = "int32",
         else:
             search_pattern = _pack_value(value, value_type).hex()
         
+        js_pattern = json.dumps(search_pattern)
+        js_regions = json.dumps(scan_regions)
         script_code = f"""
         var results = [];
-        var pattern = "{search_pattern}";
-        var ranges = Process.enumerateRanges("{scan_regions}");
+        var pattern = {js_pattern};
+        var ranges = Process.enumerateRanges({js_regions});
         
         for (var i = 0; i < ranges.length && results.length < 100000; i++) {{
             try {{
@@ -790,25 +822,14 @@ def scan_value(value: Union[int, float, str], value_type: str = "int32",
         send(JSON.stringify(results));
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
+        result_data = _run_once(script_code)
         
         if not result_data:
             return {"error": "Scan failed"}
-        
-        import json
         addresses = json.loads(result_data[0])
         _session.scan_state.results = [int(a, 16) for a in addresses]
         
-        for addr in _session.scan_state.results[:1000]:
-            _session.scan_state.last_values[addr] = value
+        _session.scan_state.last_values = {addr: value for addr in _session.scan_state.results}
         
         return {
             "success": True,
@@ -869,7 +890,7 @@ def scan_next(value: Union[int, float, str]) -> Dict[str, Any]:
             
             for (var i = 0; i < addresses.length; i++) {{
                 try {{
-                    var data = Memory.readByteArray(ptr(addresses[i]), size);
+                    var data = ptr(addresses[i]).readByteArray(size);
                     var hex = '';
                     var bytes = new Uint8Array(data);
                     for (var j = 0; j < bytes.length; j++) {{
@@ -881,18 +902,9 @@ def scan_next(value: Union[int, float, str]) -> Dict[str, Any]:
             send(JSON.stringify(matches));
             """
             
-            result_data = []
-            def on_message(message, data):
-                if message['type'] == 'send':
-                    result_data.append(message['payload'])
-            
-            script = _session.session.create_script(script_code)
-            script.on('message', on_message)
-            script.load()
-            script.unload()
+            result_data = _run_once(script_code)
             
             if result_data:
-                import json
                 matches = json.loads(result_data[0])
                 new_results.extend([int(a, 16) for a in matches])
         
@@ -957,7 +969,7 @@ def scan_changed() -> Dict[str, Any]:
             
             for (var i = 0; i < pairs.length; i++) {{
                 try {{
-                    var data = Memory.readByteArray(ptr(pairs[i][0]), size);
+                    var data = ptr(pairs[i][0]).readByteArray(size);
                     var hex = '';
                     var bytes = new Uint8Array(data);
                     for (var j = 0; j < bytes.length; j++) {{
@@ -971,18 +983,9 @@ def scan_changed() -> Dict[str, Any]:
             send(JSON.stringify(changed));
             """
             
-            result_data = []
-            def on_message(message, data):
-                if message['type'] == 'send':
-                    result_data.append(message['payload'])
-            
-            script = _session.session.create_script(script_code)
-            script.on('message', on_message)
-            script.load()
-            script.unload()
+            result_data = _run_once(script_code)
             
             if result_data:
-                import json
                 changed = json.loads(result_data[0])
                 for c in changed:
                     addr = int(c['address'], 16)
@@ -1049,7 +1052,7 @@ def scan_unchanged() -> Dict[str, Any]:
             
             for (var i = 0; i < pairs.length; i++) {{
                 try {{
-                    var data = Memory.readByteArray(ptr(pairs[i][0]), size);
+                    var data = ptr(pairs[i][0]).readByteArray(size);
                     var hex = '';
                     var bytes = new Uint8Array(data);
                     for (var j = 0; j < bytes.length; j++) {{
@@ -1063,18 +1066,9 @@ def scan_unchanged() -> Dict[str, Any]:
             send(JSON.stringify(unchanged));
             """
             
-            result_data = []
-            def on_message(message, data):
-                if message['type'] == 'send':
-                    result_data.append(message['payload'])
-            
-            script = _session.session.create_script(script_code)
-            script.on('message', on_message)
-            script.load()
-            script.unload()
+            result_data = _run_once(script_code)
             
             if result_data:
-                import json
                 unchanged = json.loads(result_data[0])
                 for c in unchanged:
                     addr = int(c['address'], 16)
@@ -1114,10 +1108,12 @@ def scan_pattern(pattern: str, scan_regions: str = "r-x") -> Dict[str, Any]:
     try:
         frida_pattern = pattern.strip()
         
+        js_pattern = json.dumps(frida_pattern)
+        js_regions = json.dumps(scan_regions)
         script_code = f"""
         var results = [];
-        var pattern = "{frida_pattern}";
-        var ranges = Process.enumerateRanges("{scan_regions}");
+        var pattern = {js_pattern};
+        var ranges = Process.enumerateRanges({js_regions});
         
         for (var i = 0; i < ranges.length && results.length < 1000; i++) {{
             try {{
@@ -1130,20 +1126,10 @@ def scan_pattern(pattern: str, scan_regions: str = "r-x") -> Dict[str, Any]:
         send(JSON.stringify(results));
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
+        result_data = _run_once(script_code)
         
         if not result_data:
             return {"error": "Pattern scan failed"}
-        
-        import json
         matches = json.loads(result_data[0])
         
         return {"success": True, "pattern": pattern, "found": len(matches), "matches": matches[:50]}
@@ -1188,7 +1174,7 @@ def get_scan_results(limit: int = 20) -> Dict[str, Any]:
         
         for (var i = 0; i < addresses.length; i++) {{
             try {{
-                var data = Memory.readByteArray(ptr(addresses[i]), size);
+                var data = ptr(addresses[i]).readByteArray(size);
                 var hex = '';
                 var bytes = new Uint8Array(data);
                 for (var j = 0; j < bytes.length; j++) {{
@@ -1202,20 +1188,10 @@ def get_scan_results(limit: int = 20) -> Dict[str, Any]:
         send(JSON.stringify(results));
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
+        result_data = _run_once(script_code)
         
         if not result_data:
             return {"error": "Failed to get results"}
-        
-        import json
         raw_results = json.loads(result_data[0])
         
         results = []
@@ -1277,20 +1253,10 @@ def list_modules() -> Dict[str, Any]:
         send(JSON.stringify(result));
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
+        result_data = _run_once(script_code)
         
         if not result_data:
             return {"error": "Failed to enumerate modules"}
-        
-        import json
         modules = json.loads(result_data[0])
         return {"count": len(modules), "modules": modules}
     
@@ -1315,8 +1281,9 @@ def get_module_info(module_name: str) -> Dict[str, Any]:
         return {"error": "Not attached. Use attach() first."}
     
     try:
+        js_module = json.dumps(module_name)
         script_code = f"""
-        var module = Process.findModuleByName("{module_name}");
+        var module = Process.findModuleByName({js_module});
         if (module) {{
             send(JSON.stringify({{
                 name: module.name, base: module.base.toString(), size: module.size,
@@ -1328,17 +1295,7 @@ def get_module_info(module_name: str) -> Dict[str, Any]:
         }}
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
-        
-        import json
+        result_data = _run_once(script_code)
         return json.loads(result_data[0]) if result_data else {"error": "No response"}
     
     except Exception as e:
@@ -1363,8 +1320,9 @@ def get_module_exports(module_name: str, filter_name: str = "") -> Dict[str, Any
         return {"error": "Not attached. Use attach() first."}
     
     try:
+        js_module = json.dumps(module_name)
         script_code = f"""
-        var module = Process.findModuleByName("{module_name}");
+        var module = Process.findModuleByName({js_module});
         if (module) {{
             var exports = module.enumerateExports();
             send(JSON.stringify(exports.map(function(e) {{
@@ -1375,17 +1333,7 @@ def get_module_exports(module_name: str, filter_name: str = "") -> Dict[str, Any
         }}
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
-        
-        import json
+        result_data = _run_once(script_code)
         exports = json.loads(result_data[0]) if result_data else []
         
         if filter_name:
@@ -1415,8 +1363,9 @@ def get_module_imports(module_name: str, filter_name: str = "") -> Dict[str, Any
         return {"error": "Not attached. Use attach() first."}
     
     try:
+        js_module = json.dumps(module_name)
         script_code = f"""
-        var module = Process.findModuleByName("{module_name}");
+        var module = Process.findModuleByName({js_module});
         if (module) {{
             var imports = module.enumerateImports();
             send(JSON.stringify(imports.map(function(i) {{
@@ -1428,17 +1377,7 @@ def get_module_imports(module_name: str, filter_name: str = "") -> Dict[str, Any
         }}
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
-        
-        import json
+        result_data = _run_once(script_code)
         imports = json.loads(result_data[0]) if result_data else []
         
         if filter_name:
@@ -1469,21 +1408,16 @@ def resolve_symbol(module_name: str, symbol_name: str) -> Dict[str, Any]:
     
     try:
         script_code = f"""
-        var addr = Module.findExportByName("{module_name}", "{symbol_name}");
-        send(JSON.stringify(addr ? {{address: addr.toString()}} : {{error: "Symbol not found"}}));
+        var module = Process.findModuleByName({json.dumps(module_name)});
+        if (!module) {{
+            send(JSON.stringify({{error: "Module not found"}}));
+        }} else {{
+            var addr = module.getExportByName({json.dumps(symbol_name)});
+            send(JSON.stringify(addr ? {{address: addr.toString()}} : {{error: "Symbol not found"}}));
+        }}
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
-        
-        import json
+        result_data = _run_once(script_code)
         result = json.loads(result_data[0]) if result_data else {"error": "No response"}
         result["module"] = module_name
         result["symbol"] = symbol_name
@@ -1626,27 +1560,6 @@ def replace_function(address: str, return_value: Union[int, str] = 0) -> Dict[st
 
 
 @mcp.tool()
-def hook_native_function(address: str, calling_convention: str = "default",
-                         arg_types: List[str] = None, return_type: str = "int",
-                         on_enter: str = "", on_leave: str = "") -> Dict[str, Any]:
-    """
-    Hook a native function with explicit calling convention.
-    
-    Args:
-        address: Address of function
-        calling_convention: "default", "stdcall", "fastcall", "thiscall"
-        arg_types: List of argument types
-        return_type: Return type
-        on_enter: JavaScript for onEnter
-        on_leave: JavaScript for onLeave
-    
-    Returns:
-        Hook status.
-    """
-    return hook_function(address, on_enter, on_leave, f"Native hook ({calling_convention})")
-
-
-@mcp.tool()
 def list_hooks() -> Dict[str, Any]:
     """
     List all active hooks.
@@ -1784,17 +1697,7 @@ def read_registers() -> Dict[str, Any]:
         }));
         """
         
-        result_data = []
-        def on_message(message, data):
-            if message['type'] == 'send':
-                result_data.append(message['payload'])
-        
-        script = _session.session.create_script(script_code)
-        script.on('message', on_message)
-        script.load()
-        script.unload()
-        
-        import json
+        result_data = _run_once(script_code)
         result = json.loads(result_data[0]) if result_data else {}
         result["note"] = "Full registers available in hook via 'this.context'"
         return result
@@ -1829,11 +1732,29 @@ def load_script(script_code: str, name: str = "custom") -> Dict[str, Any]:
     
     try:
         script = _session.session.create_script(script_code)
-        script.on('message', lambda m, d: logger.info(f"[{name}] {m}"))
+        _session.script_messages[name] = []
+        
+        def _buffer_message(message, data):
+            import time as _time
+            msg = {"type": message.get("type", "unknown"),
+                   "payload": message.get("payload", None),
+                   "description": message.get("description", None),
+                   "stack": message.get("stack", None),
+                   "time": _time.time()}
+            _session.script_messages[name].append(msg)
+            if len(_session.script_messages[name]) > 200:
+                _session.script_messages[name] = _session.script_messages[name][-200:]
+            logger.info(f"[{name}] {message['type']}: {message.get('payload')}")
+        
+        script.on('message', _buffer_message)
         script.load()
         
         _session.custom_scripts[name] = script
-        return {"success": True, "name": name}
+        return {
+            "success": True,
+            "name": name,
+            "hint": "Use get_script_output() to read messages sent via send() from the script."
+        }
     
     except Exception as e:
         return {"error": f"Failed to load script: {str(e)}"}
@@ -1858,6 +1779,7 @@ def unload_script(name: str) -> Dict[str, Any]:
     try:
         _session.custom_scripts[name].unload()
         del _session.custom_scripts[name]
+        _session.script_messages.pop(name, None)
         return {"success": True, "name": name}
     
     except Exception as e:
@@ -1865,33 +1787,51 @@ def unload_script(name: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def call_rpc(name: str, method: str, args: List[Any] = None) -> Dict[str, Any]:
+def get_script_output(name: str, limit: int = 50, clear: bool = False) -> Dict[str, Any]:
     """
-    Call an RPC export from a loaded script.
-    
+    Read buffered messages from a loaded custom script.
+
+    Scripts communicate with the host by calling send() in JavaScript.
+    Every message is buffered here until you read it.
+
     Args:
         name: Name of the loaded script
-        method: RPC method name to call
-        args: Arguments to pass
-    
+        limit: Maximum messages to return (default 50)
+        clear: If true, remove returned messages from the buffer
+
     Returns:
-        RPC result.
+        Buffered messages list with optional clear status.
     """
     global _session
     
     if name not in _session.custom_scripts:
         return {"error": f"Script '{name}' not found"}
     
-    try:
-        script = _session.custom_scripts[name]
-        rpc_method = getattr(script.exports, method)
-        result = rpc_method(*(args or []))
-        return {"success": True, "method": method, "result": result}
+    msgs = _session.script_messages.get(name, [])
+    if not msgs:
+        return {"success": True, "name": name, "count": 0, "messages": []}
     
-    except AttributeError:
-        return {"error": f"RPC method '{method}' not found"}
-    except Exception as e:
-        return {"error": f"RPC call failed: {str(e)}"}
+    out = msgs[-limit:] if len(msgs) > limit else msgs
+    if clear:
+        _session.script_messages[name] = msgs[:-len(out)] if len(msgs) > len(out) else []
+    
+    return {"success": True, "name": name, "count": len(out), "messages": out}
+
+
+@mcp.tool()
+def list_custom_scripts() -> Dict[str, Any]:
+    """
+    List loaded custom scripts and their message counts.
+    
+    Returns:
+        List of script names and pending message counts.
+    """
+    global _session
+    result = []
+    for name, script in _session.custom_scripts.items():
+        count = len(_session.script_messages.get(name, []))
+        result.append({"name": name, "pending_messages": count})
+    return {"count": len(result), "scripts": result}
 
 
 # =============================================================================

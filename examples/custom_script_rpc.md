@@ -1,10 +1,16 @@
-# Example: Custom Scripts with RPC
+# Example: Custom Scripts with send() + get_script_output()
 
-This example shows how to load custom Frida scripts and call them via RPC.
+This example shows how to load custom Frida scripts and read their output.
 
 ## Scenario
 
 You want to create a reusable "god mode" script that can be toggled on/off.
+
+## How it works
+
+Scripts communicate with the host by calling `send()` in JavaScript. Every
+message is buffered by the MCP server and read with `get_script_output()`.
+No RPC method guessing needed — the agent just polls the buffer.
 
 ## Create and Load the Script
 
@@ -14,93 +20,99 @@ You want to create a reusable "god mode" script that can be toggled on/off.
 > load_script('''
     var godModeEnabled = false;
     var healthAddress = null;
-    var originalDamageFunc = null;
-    
-    rpc.exports = {
-        // Find the health address
-        findHealth: function(currentValue) {
-            var results = [];
-            var ranges = Process.enumerateRanges("rw-");
-            var pattern = "";
-            
-            // Convert to little-endian hex
-            var buf = Memory.alloc(4);
-            buf.writeS32(currentValue);
-            pattern = buf.readByteArray(4);
-            
-            for (var i = 0; i < ranges.length; i++) {
-                try {
-                    var matches = Memory.scanSync(ranges[i].base, ranges[i].size, 
-                        Array.from(new Uint8Array(pattern)).map(b => 
-                            ('0' + b.toString(16)).slice(-2)).join(' '));
-                    matches.forEach(m => results.push(m.address.toString()));
-                } catch (e) {}
-            }
-            return results.slice(0, 100);
-        },
-        
-        // Set health address for god mode
-        setHealthAddress: function(addr) {
-            healthAddress = ptr(addr);
-            return "Health address set to " + addr;
-        },
-        
-        // Toggle god mode
-        toggleGodMode: function() {
-            godModeEnabled = !godModeEnabled;
-            return "God mode: " + (godModeEnabled ? "ON" : "OFF");
-        },
-        
-        // Set health value
-        setHealth: function(value) {
-            if (!healthAddress) return "Health address not set!";
-            healthAddress.writeS32(value);
-            return "Health set to " + value;
-        },
-        
-        // Get current health
-        getHealth: function() {
-            if (!healthAddress) return "Health address not set!";
-            return healthAddress.readS32();
+
+    // Find the health address
+    function findHealth(currentValue) {
+        var results = [];
+        var ranges = Process.enumerateRanges("rw-");
+        var buf = Memory.alloc(4);
+        buf.writeS32(currentValue);
+        var pattern = Array.from(new Uint8Array(buf.readByteArray(4)))
+            .map(b => ('0' + b.toString(16)).slice(-2)).join(' ');
+
+        for (var i = 0; i < ranges.length; i++) {
+            try {
+                var matches = Memory.scanSync(ranges[i].base, ranges[i].size, pattern);
+                matches.forEach(m => results.push(m.address.toString()));
+            } catch (e) {}
         }
-    };
-    
+        send({type: "health_addresses", addresses: results.slice(0, 100)});
+    }
+
+    // Toggle god mode
+    function toggleGodMode() {
+        godModeEnabled = !godModeEnabled;
+        send({type: "godmode", enabled: godModeEnabled});
+    }
+
+    // Set health value
+    function setHealth(value) {
+        if (!healthAddress) { send({type: "error", msg: "Health address not set!"}); return; }
+        healthAddress.writeS32(value);
+        send({type: "health", value: value});
+    }
+
+    // Get current health
+    function getHealth() {
+        if (!healthAddress) { send({type: "error", msg: "Health address not set!"}); return; }
+        send({type: "health", value: healthAddress.readS32()});
+    }
+
+    // Example: run findHealth(100) on load
+    findHealth(100);
     console.log("[GodMode] Script loaded!");
 ''', "godmode")
 ```
 
-## Use the RPC Methods
+## Read the Output
 
 ```
-# Find health when it's at 100
-> call_rpc("godmode", "findHealth", [100])
+# After load, the script already ran findHealth(100) and sent results
+> get_script_output("godmode")
 {
-  "result": ["0x12345678", "0x23456789", ...]
+  "count": 1,
+  "messages": [
+    {"type": "send", "payload": {"type": "health_addresses", "addresses": ["0x12345678", ...]}}
+  ]
 }
+```
 
-# After narrowing down, set the health address
-> call_rpc("godmode", "setHealthAddress", ["0x12345678"])
-{
-  "result": "Health address set to 0x12345678"
-}
+## Passing Input to a Script
 
-# Toggle god mode on
-> call_rpc("godmode", "toggleGodMode", [])
-{
-  "result": "God mode: ON"
-}
+Scripts are loaded with fixed code. To change behavior, load a new script
+with the value embedded, or unload and reload:
 
-# Set health to max
-> call_rpc("godmode", "setHealth", [9999])
-{
-  "result": "Health set to 9999"
-}
+```
+> unload_script("godmode")
 
-# Check current health
-> call_rpc("godmode", "getHealth", [])
+> load_script('''
+    var healthAddress = ptr("0x12345678");
+    healthAddress.writeS32(9999);
+    send({type: "health", value: healthAddress.readS32()});
+''', "set_health")
+
+> get_script_output("set_health")
 {
-  "result": 9999
+  "count": 1,
+  "messages": [
+    {"type": "send", "payload": {"type": "health", "value": 9999}}
+  ]
 }
+```
+
+## Long-Running Scripts
+
+For scripts that keep running (timers, hooks), poll repeatedly:
+
+```
+> load_script('''
+    setInterval(function() {
+        send({type: "tick", health: ptr("0x12345678").readS32()});
+    }, 1000);
+''', "monitor")
+
+# Later:
+> get_script_output("monitor", limit=10, clear=true)
 ```
 
 ## Cleanup
@@ -113,10 +125,10 @@ You want to create a reusable "god mode" script that can be toggled on/off.
 {"success": true}
 ```
 
-## Benefits of RPC Scripts
+## Benefits of send() + get_script_output()
 
-1. **Persistent State**: Variables persist between calls
-2. **Complex Logic**: Full JavaScript for game-specific hacks
-3. **Performance**: Script runs in-process, no IPC overhead
-4. **Reusability**: Load once, call many times
-
+1. **No RPC method guessing** — the agent reads whatever the script sends
+2. **Persistent State**: Variables persist while the script is loaded
+3. **Complex Logic**: Full JavaScript for game-specific hacks
+4. **Performance**: Script runs in-process, no IPC overhead
+5. **Reusability**: Load once, poll many times
