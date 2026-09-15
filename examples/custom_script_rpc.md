@@ -100,6 +100,30 @@ with the value embedded, or unload and reload:
 }
 ```
 
+## Iterating on a Script Without Full Reload
+
+Instead of unload_script() + load_script() (which re-sends the entire source),
+patch one line with replace_in_script():
+
+```
+> get_script_source("probe")
+{"success": true, "name": "probe", "source": "var b = Module.findBaseAddress(\"GameAssembly.dll\");"}
+
+> replace_in_script("probe",
+    "Module.findBaseAddress(\"GameAssembly.dll\")",
+    "Process.findModuleByName(\"GameAssembly.dll\").base")
+{"success": true, "name": "probe"}
+
+> get_script_output("probe")
+```
+
+- **Edit**: `replace_in_script("n", "old_line", "new_line")`
+- **Insert after**: `replace_in_script("n", "anchor", "anchor\nnew_line")`
+- **Delete**: `replace_in_script("n", "line_to_remove", "")`
+
+Exact-string match — no line numbers, so edits never shift offsets.
+The script is unloaded and reloaded atomically; JS state resets.
+
 ## Long-Running Scripts
 
 For scripts that keep running (timers, hooks), poll repeatedly:

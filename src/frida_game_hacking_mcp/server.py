@@ -288,7 +288,7 @@ def list_capabilities() -> Dict[str, Any]:
             ],
             "script_management": [
                 "load_script", "unload_script", "get_script_output",
-                "list_custom_scripts"
+                "list_custom_scripts", "get_script_source", "replace_in_script"
             ],
             "window_interaction": [
                 "list_windows", "screenshot_window", "screenshot_screen",
@@ -301,7 +301,7 @@ def list_capabilities() -> Dict[str, Any]:
                 "get_js_api_surface"
             ]
         },
-        "total_tools": 43
+        "total_tools": 45
     }
 
 
@@ -372,6 +372,16 @@ Scripts communicate by calling send(). Read output with get_script_output().
 4. Pass new input: unload + load a new script with updated values.
 
 No RPC method guessing needed — read whatever the script sends.
+
+EDITING A LOADED SCRIPT (no full reload):
+   get_script_source("read_hp")          # read current source
+   replace_in_script("read_hp",
+       "Module.findBaseAddress('x')",    # exact old text (must be unique)
+       "Process.findModuleByName('x').base")
+   # unloads + reloads atomically; state resets; errors stay enriched
+
+   Insert a line:  replace_in_script("n", "anchor", "anchor\\nnew_line")
+   Delete a line:  replace_in_script("n", "line_to_remove", "")
 
 SELF-FIXING REMOVED APIS:
    If a script fails with "not a function" (e.g. Module.findBaseAddress
@@ -1933,6 +1943,59 @@ def list_custom_scripts() -> Dict[str, Any]:
         count = len(_session.script_messages.get(name, []))
         result.append({"name": name, "pending_messages": count})
     return {"count": len(result), "scripts": result}
+
+
+@mcp.tool()
+def get_script_source(name: str) -> Dict[str, Any]:
+    """
+    Return the source code of a loaded custom script.
+
+    Args:
+        name: Name of the loaded script
+
+    Returns:
+        The script source, or an error if not found.
+    """
+    global _session
+    source = _session.script_sources.get(name)
+    if source is None:
+        return {"error": f"Script '{name}' not found"}
+    return {"success": True, "name": name, "source": source}
+
+
+@mcp.tool()
+def replace_in_script(name: str, old: str, new: str) -> Dict[str, Any]:
+    """
+    Replace one occurrence of *old* in a loaded script's source and reload it.
+
+    Frida cannot hot-patch a running script, so this unloads the old script
+    and loads the new one in a single call (instead of unload_script() +
+    load_script()). Matching is exact-string based — no line numbers, so
+    edits never shift line offsets. Script state (variables, timers, hooks)
+    resets on reload.
+
+    Args:
+        name: Name of the loaded script
+        old: Exact text to find (must appear exactly once)
+        new: Replacement text
+
+    Returns:
+        Reload status; on failure, the enriched error messages.
+    """
+    global _session
+    if name not in _session.custom_scripts:
+        return {"error": f"Script '{name}' not found"}
+    source = _session.script_sources.get(name, "")
+    count = source.count(old)
+    if count == 0:
+        return {"error": f"Text not found in script '{name}'",
+                "hint": "Use get_script_source() to read the current source."}
+    if count > 1:
+        return {"error": f"Text found {count} times in script '{name}'",
+                "hint": "Include more surrounding context to make the match unique."}
+    new_source = source.replace(old, new, 1)
+    unload_script(name)
+    return load_script(new_source, name)
 
 
 # ---------- API surface introspection ----------
